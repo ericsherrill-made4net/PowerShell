@@ -11,21 +11,12 @@ permissions:
 
 jobs:
   update-psgallery-manifests:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Install PowerShell
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget apt-transport-https gnupg ca-certificates
-          wget -qO- https://packages.microsoft.com/keys/microsoft.asc | sudo gpg --dearmour -o /usr/share/keyrings/microsoft.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/24.04/prod noble main" | sudo tee /etc/apt/sources.list.d/microsoft-prod.list
-          sudo apt-get update
-          sudo apt-get install -y powershell
 
       - name: Find/Update RequiredModules in .psd1/.psm1/.ps1 files
         id: check_updates
@@ -190,7 +181,7 @@ jobs:
 
           echo "changes=true" >> $env:GITHUB_OUTPUT
           echo "changed_files=$(($changedFiles -join ';'))" >> $env:GITHUB_OUTPUT
-
+          
       - name: Create Pull Request with changes
         if: steps.check_updates.outputs.changes == 'true'
         uses: peter-evans/create-pull-request@v4
