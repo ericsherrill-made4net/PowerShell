@@ -19,9 +19,9 @@ jobs:
           fetch-depth: 0
 
       - name: Setup PowerShell
-        uses: actions/setup-powershell@v2
+        uses: PowerShell/setup-powershell@v2
         with:
-          version: '7.x'
+          pwsh-version: '7.x'
 
       - name: Find/Update RequiredModules in .psd1/.psm1/.ps1 files
         id: check_updates
