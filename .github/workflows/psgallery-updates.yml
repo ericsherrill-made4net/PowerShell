@@ -192,8 +192,8 @@ jobs:
         uses: peter-evans/create-pull-request@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: chore: update PSGallery RequiredModule versions
+          commit-message: "chore: update PSGallery RequiredModule versions"
           branch: dependabot/psgallery-updates-${{ github.run_id }}
-          title: chore: update PSGallery RequiredModule versions
+          title: "chore: update PSGallery RequiredModule versions"
           body-file: updates.md
           labels: dependabot, automation
