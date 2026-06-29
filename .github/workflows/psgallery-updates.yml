@@ -1,0 +1,199 @@
+name: PSGallery module updates (auto-update manifests)
+
+on:
+  schedule:
+    # Weekly run (Monday 03:00 UTC) — adjust as needed
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-psgallery-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PowerShell
+        uses: actions/setup-powershell@v2
+        with:
+          version: '7.x'
+
+      - name: Find/Update RequiredModules in .psd1/.psm1/.ps1 files
+        id: check_updates
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Helper: ensure Find-Module is available
+          if (-not (Get-Command -Name Find-Module -ErrorAction SilentlyContinue)) {
+            Write-Host "Find-Module not present. Attempting Install-Module PowerShellGet..."
+            try {
+              Install-Module -Name PowerShellGet -Force -Scope CurrentUser -AllowClobber -Repository PSGallery -Confirm:$false -ErrorAction Stop
+            } catch {
+              Write-Host "Warning: Could not install PowerShellGet: $_"
+            }
+          }
+
+          $files = Get-ChildItem -Path . -Recurse -File -Include *.psd1,*.psm1,*.ps1 -ErrorAction SilentlyContinue
+          if (-not $files) {
+            Write-Host "No manifest/script files found."
+            echo "changes=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $updates = @()
+          $changedFiles = @()
+
+          # Regex to find RequiredModules = @( ... ) blocks (multiline)
+          $reqBlockRegex = '(?ms)(RequiredModules\s*=\s*@\()(?<inner>.*?)(\)\s*,?)'
+
+          foreach ($file in $files) {
+            $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $file.FullName
+            $origContent = $content
+            $modified = $false
+
+            $content = [regex]::Replace($content, $reqBlockRegex, {
+              param($match)
+              $inner = $match.Groups['inner'].Value
+              $innerOrig = $inner
+              $innerNew = $inner
+
+              # 1) Update hashtable entries: @{ ... } occurrences
+              $htRegex = '(?ms)@\{(?<body>.*?)\}'
+              $htMatches = [regex]::Matches($inner, $htRegex)
+              foreach ($ht in $htMatches) {
+                $body = $ht.Groups['body'].Value
+
+                # Find module name in a variety of common keys
+                $nameMatch = [regex]::Match($body, "ModuleName\s*=\s*'(?<n>[^']+)'")
+                if (-not $nameMatch.Success) { $nameMatch = [regex]::Match($body, "Name\s*=\s*'(?<n>[^']+)'") }
+                if (-not $nameMatch.Success) { $nameMatch = [regex]::Match($body, "Module\s*=\s*'(?<n>[^']+)'") }
+
+                if ($nameMatch.Success) {
+                  $name = $nameMatch.Groups['n'].Value
+                  $verMatch = [regex]::Match($body, "RequiredVersion\s*=\s*'(?<v>[^']+)'")
+                  $currentVer = if ($verMatch.Success) { $verMatch.Groups['v'].Value } else { $null }
+
+                  # Query PSGallery
+                  try {
+                    $found = Find-Module -Name $name -Repository PSGallery -ErrorAction Stop
+                  } catch {
+                    Write-Host "Warning: Module '$name' not found in PSGallery. Skipping update for this entry."
+                    continue
+                  }
+                  $latestVer = $found.Version.ToString()
+
+                  # Compare versions if current exists
+                  $needUpdate = $false
+                  if (-not $currentVer) { $needUpdate = $true } else {
+                    try {
+                      if ([version]$latestVer -gt [version]$currentVer) { $needUpdate = $true }
+                    } catch {
+                      # If version comparison fails, only update if different string
+                      if ($latestVer -ne $currentVer) { $needUpdate = $true }
+                    }
+                  }
+
+                  if ($needUpdate) {
+                    if ($verMatch.Success) {
+                      # replace existing RequiredVersion value
+                      $newBody = $body -replace "RequiredVersion\s*=\s*'[^']+'", "RequiredVersion = '$latestVer'"
+                    } else {
+                      # insert RequiredVersion before the closing (preserve semicolons/spacing)
+                      $newBody = $body.TrimEnd()
+                      if ($newBody -match '\S$') { $newBody += '; ' }
+                      $newBody += "RequiredVersion = '$latestVer'"
+                    }
+
+                    # replace this hashtable instance in innerNew
+                    $oldHt = $ht.Value
+                    $newHt = "@{${newBody}}"
+                    $innerNew = $innerNew -replace [regex]::Escape($oldHt), [regex]::Escape($newHt)
+                    $updates += [PSCustomObject]@{ file = $file.FullName; module = $name; old = ($currentVer -ne $null ? $currentVer : '(none)'); new = $latestVer }
+                    $modified = $true
+                  }
+                }
+              }
+
+              # 2) Update simple string entries inside the RequiredModules block: 'ModuleName' or "ModuleName"
+              # Match single-quoted or double-quoted bare entries that are not immediately part of a hashtable (simple heuristic)
+              $stringEntryRegex = "(?ms)(?<quote>['\"])(?<name>[A-Za-z0-9\.\-_]+)\k<quote>"
+              $innerNew = [regex]::Replace($innerNew, $stringEntryRegex, {
+                param($m)
+                $name = $m.Groups['name'].Value
+
+                # Skip if this string is already inside an @{ ... } (we handled hashtable above)
+                $index = $m.Index
+                # Check context around the match for '@{' earlier
+                $pre = $innerNew.Substring([math]::Max(0,$index-20), [math]::Min(20, $index))
+                if ($pre -match '@\{') {
+                  return $m.Value
+                }
+
+                # Query PSGallery
+                try {
+                  $found = Find-Module -Name $name -Repository PSGallery -ErrorAction Stop
+                } catch {
+                  return $m.Value
+                }
+                $latestVer = $found.Version.ToString()
+                $updates += [PSCustomObject]@{ file = $file.FullName; module = $name; old = '(string-entry)'; new = $latestVer }
+                $modified = $true
+                # Replace string entry with a hashtable that includes RequiredVersion
+                return "@{ModuleName = '$name'; RequiredVersion = '$latestVer'}"
+              })
+
+              if ($innerNew -ne $innerOrig) {
+                return $match.Groups[1].Value + $innerNew + "))"  # re-add the closing paren(s)
+              } else {
+                return $match.Value
+              }
+            })
+
+            # If content changed, write file back
+            if ($content -ne $origContent) {
+              Set-Content -LiteralPath $file.FullName -Value $content -Encoding UTF8
+              $changedFiles += $file.FullName
+            }
+          }
+
+          if ($changedFiles.Count -eq 0) {
+            Write-Host "No RequiredModules updates found in repository files."
+            echo "changes=false" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          # Create updates.md summary
+          $body = @()
+          $body += "# PSGallery module updates (automated)"
+          $body += ""
+          $body += "This workflow found and updated RequiredVersion entries in the following files:"
+          $body += ""
+          foreach ($u in $updates | Sort-Object file,module) {
+            $body += "* `$($u.file)` — **$($u.module)**: $($u.old) → $($u.new)"
+          }
+          $body += ""
+          $body += "Please review the changes before merging."
+          $body | Out-File -FilePath updates.md -Encoding utf8
+
+          # Export changed file list for later steps
+          $changedFiles | Out-File -FilePath changed_files.txt -Encoding utf8
+
+          echo "changes=true" >> $env:GITHUB_OUTPUT
+          echo "changed_files=$(($changedFiles -join ';'))" >> $env:GITHUB_OUTPUT
+
+      - name: Create Pull Request with changes
+        if: steps.check_updates.outputs.changes == 'true'
+        uses: peter-evans/create-pull-request@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: chore: update PSGallery RequiredModule versions
+          branch: dependabot/psgallery-updates-${{ github.run_id }}
+          title: chore: update PSGallery RequiredModule versions
+          body-file: updates.md
+          labels: dependabot, automation
